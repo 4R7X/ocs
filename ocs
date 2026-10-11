@@ -1,0 +1,520 @@
+#!/bin/bash
+# ocs — run opencode inside a bubblewrap sandbox.
+#
+# The sandbox sees the project, a read-only toolchain, and nothing else.
+#
+#   ocs <project> [--allow DIR...] [--ro DIR...] [--dev DEV...] [--no-net] [--] [args...]
+#   ocs --help | --version
+#   bats ocs.bats
+#
+# Environment read by ocs: NO_COLOR, and OCS_TEST_CMD (a test hook
+# that runs a shell in the sandbox instead of opencode).
+# ANTHROPIC_API_KEY, OPENAI_API_KEY and OPENCODE_API_KEY are forwarded if set.
+
+set -euo pipefail
+
+readonly PROG=ocs
+readonly VERSION=1.0.0
+readonly TAGLINE="Run opencode inside a bubblewrap sandbox."
+
+BREW=${HOMEBREW_PREFIX:-}
+if [[ -z $BREW ]] && command -v brew >/dev/null 2>&1; then
+    BREW=$(brew --prefix 2>/dev/null) || BREW=''
+fi
+
+BREW_SUBDIRS=(bin Cellar etc lib share)
+
+# Candidate toolchain prefixes. Only the ones that exist are bound, and PATH is
+# built from what was actually bound, so the sandbox never advertises a
+# directory that is not there. Grant something else with --ro/--allow.
+TOOLCHAIN_DIRS=()
+for d in /opt "$HOME/.local/bin" "$HOME/.cargo/bin" "$HOME/go/bin"; do
+    [[ -d $d ]] && TOOLCHAIN_DIRS+=("$d")
+done
+
+declare -a SYSTEM_DIRS=()
+for d in /usr/local/bin /usr/bin /bin; do
+    [[ -d $d ]] && SYSTEM_DIRS+=("$d")
+done
+
+# bin/opencode is a symlink into <prefix>/Cellar/<pkg>/<ver>/bin/opencode, so
+# the prefix the binary needs is whatever its real path sits under. That is the
+# authority when it disagrees with BREW, for the rpath reason above.
+prefix_of() {
+    local real=$1
+    [[ $real == */Cellar/* ]] || return 1
+    printf '%s\n' "${real%%/Cellar/*}"
+}
+
+#
+# Sandbox policy;
+# anything not mentioned here is invisible to the agent. Runtime flags layer on
+# afterwards in build_args().
+
+BWRAP_ARGS=(
+    --unshare-all
+    --die-with-parent
+    --new-session              # setsid, blocks TIOCSTI terminal injection
+    --cap-drop ALL
+
+    --clearenv                 # the sandbox starts from nothing
+    --proc /proc
+    --dev /dev                 # fresh minimal devtmpfs, NOT the host's
+    --tmpfs /tmp
+    --tmpfs /run
+
+    --ro-bind /usr /usr
+    # TOOLCHAIN_DIRS holds only prefixes that exist; see above.
+
+    # Homebrew is bound in build_args(), and only when opencode actually lives
+    # in it. Having brew for other packages must not hand the agent all of
+    # $BREW/bin when opencode came from somewhere else.
+
+    # Config stuff. Arch's ca-certificates.crt is a RELATIVE symlink to
+    # ../../ca-certificates/extracted/tls-ca-bundle.pem, so /etc/ca-certificates
+    # must be bound too or TLS fails with curl error 77.
+    --dir /etc
+    --ro-bind-try /etc/resolv.conf   /etc/resolv.conf
+    --ro-bind-try /etc/hosts         /etc/hosts
+    --ro-bind-try /etc/nsswitch.conf /etc/nsswitch.conf
+    --ro-bind-try /etc/passwd        /etc/passwd
+    --ro-bind-try /etc/group         /etc/group
+    --ro-bind-try /etc/localtime     /etc/localtime
+    --ro-bind-try /etc/ssl           /etc/ssl
+    --ro-bind-try /etc/ca-certificates /etc/ca-certificates
+
+    # opencode's config and state.
+    --dir "$HOME"
+    --dir "$HOME/.config" --dir "$HOME/.cache"
+    --dir "$HOME/.local" --dir "$HOME/.local/share" --dir "$HOME/.local/state"
+    --bind-try "$HOME/.config/opencode"      "$HOME/.config/opencode"
+    --bind-try "$HOME/.cache/opencode"       "$HOME/.cache/opencode"
+    --bind-try "$HOME/.local/share/opencode" "$HOME/.local/share/opencode"
+    --bind-try "$HOME/.local/state/opencode" "$HOME/.local/state/opencode"
+
+    # usr-merged systems have these as symlinks into /usr.
+    --symlink usr/bin /bin
+    --symlink usr/sbin /sbin
+    --symlink usr/lib /lib
+    --symlink usr/lib64 /lib64
+
+    --setenv HOME "$HOME"
+    --setenv TMPDIR /tmp
+    --setenv TERM "${TERM:-xterm-256color}"
+    --setenv NO_PROXY "localhost,127.0.0.1,::1"
+)
+
+PROJECT=""
+SHARE_NET=1
+USE_COLOR=1
+SERVE=0
+SERVE_PORT=""
+SERVE_HOST=""
+OPENCODE_BIN=""
+OPENCODE_DIR=""
+OPENCODE_PREFIX=""
+declare -a OPENCODE_ARGS=()
+declare -a ALLOW_PATHS=()
+declare -a RO_PATHS=()
+declare -a DEV_PATHS=()
+
+setup_colors() {
+    # Declared before any tput call, not after. tput fails per capability, not
+    # wholesale: on TERM=sun "tput sgr0" succeeds and "tput bold" fails. A bare
+    # `|| return 0` would then leave C_BOLD unset, and set -u would turn the
+    # next die() into "unbound variable" instead of the error message.
+    C_RESET='' C_BOLD='' C_DIM='' C_RED='' C_CYAN=''
+
+    if ((USE_COLOR)) && [[ -t 2 && -z ${NO_COLOR:-} ]] && command -v tput >/dev/null 2>&1; then
+        C_RESET=$(tput sgr0 2>/dev/null) || :
+        C_BOLD=$(tput bold 2>/dev/null) || :
+        C_DIM=$(tput dim 2>/dev/null) || :
+        C_RED=$(tput setaf 1 2>/dev/null) || :
+        C_CYAN=$(tput setaf 6 2>/dev/null) || :
+    fi
+}
+
+info()  { printf '%s\n' "$*" >&2; }
+die()   { printf '%serror:%s %s\n' "$C_RED" "$C_RESET" "$*" >&2; exit 1; }
+
+usage() {
+    local -a flags descs
+    flags=(
+        "-a, --allow <DIR>"
+        "-r, --ro <DIR>"
+        "-d, --dev <DEV>"
+        "-s, --serve"
+        "-p, --port <PORT>"
+        "    --host <HOST>"
+        "-nn, --no-net"
+        "-nc, --no-color"
+        "-h, --help"
+        "-V, --version"
+    )
+    descs=(
+        "Read-write access to host directories"
+        "Read-only access to host directories"
+        "Expose a host device, by name or path"
+        "Run the web UI (opencode serve) instead of the terminal UI"
+        "Port for --serve; opencode picks the next free one otherwise"
+        "Address for --serve, e.g. 0.0.0.0 to reach it from other devices"
+        "Unshare the network namespace; run fully offline"
+        "Disable coloured output (NO_COLOR is honoured too)"
+        "Print this help"
+        "Print version"
+    )
+
+    local w=0 i len
+    for i in "${!flags[@]}"; do
+        len=${#flags[i]}
+        if ((len > w)); then w=$len; fi
+    done
+
+    {
+        printf '%s%s%s %s%s%s\n' "$C_BOLD$C_CYAN" "$PROG" "$C_RESET" "$C_DIM" "$VERSION" "$C_RESET"
+        printf '%s\n' "$TAGLINE"
+        printf '\n%sUSAGE%s\n' "$C_BOLD" "$C_RESET"
+        printf '  %s%s%s %s[OPTIONS]%s <PROJECT> %s[-- OPENCODE_ARGS]%s\n' \
+            "$C_BOLD" "$PROG" "$C_RESET" "$C_DIM" "$C_RESET" "$C_DIM" "$C_RESET"
+
+        printf '\n%sOPTIONS%s\n' "$C_BOLD" "$C_RESET"
+        for i in "${!flags[@]}"; do
+            printf '  %s%s%s%*s  %s%s%s\n' \
+                "$C_CYAN" "${flags[i]}" "$C_RESET" \
+                $(( w - ${#flags[i]} )) '' \
+                "$C_DIM" "${descs[i]}" "$C_RESET"
+        done
+
+        cat <<EOF
+
+${C_BOLD}EXAMPLES${C_RESET}
+
+  ${C_DIM}  ocs ~/code/project --allow ~/shared --allow ~/scratch --ro /opt/ref${C_RESET}
+  ${C_DIM}  ocs ~/code/project --allow=~/shared,~/scratch --ro=/opt/ref${C_RESET}
+
+  ${C_DIM}Because a space-form value cannot be read as a flag, one that begins${C_RESET}
+  ${C_DIM}with a dash needs the = form: --allow=-weird-dir.${C_RESET}
+
+  ${C_DIM}  ocs ~/code/project -s -p 4455 --host 0.0.0.0${C_RESET}
+  ${C_DIM}      ${C_DIM}Web UI on this machine and on your LAN${C_RESET}
+
+${C_BOLD}ENVIRONMENT${C_RESET}
+  ${C_DIM}NO_COLOR     Any value disables colour, as does --no-color${C_RESET}
+  ${C_DIM}OCS_TEST_CMD Test hook: run with /bin/sh in the sandbox instead${C_RESET}
+  ${C_DIM}             of opencode${C_RESET}
+
+  ${C_DIM}ANTHROPIC_API_KEY, OPENAI_API_KEY and OPENCODE_API_KEY are forwarded${C_RESET}
+  ${C_DIM}into the sandbox when set. Nothing is written to disk.${C_RESET}
+EOF
+    } >&2
+}
+
+search_opencode() {
+    local -a candidates=()
+    local dir resolved real
+
+    if resolved=$(command -v opencode 2>/dev/null); then
+        dir=$(dirname "$resolved")
+        candidates+=("$dir/opencode")
+    fi
+    # Only when there is a brew: an empty BREW would turn this into
+    # "/bin/opencode", a duplicate of the /usr/bin entry below.
+    [[ -n $BREW ]] && candidates+=("$BREW/bin/opencode")
+    candidates+=(
+        "$HOME/.opencode/bin/opencode"
+        "$HOME/.local/bin/opencode"
+        /usr/local/bin/opencode
+        /usr/bin/opencode
+        /opt/opencode/bin/opencode
+    )
+
+    for dir in "${candidates[@]}"; do
+        [[ -x $dir ]] || continue
+
+        OPENCODE_BIN=$dir
+        real=$(readlink -f "$dir" 2>/dev/null) || real=''
+        if [[ -n $real && $real != / ]]; then
+            OPENCODE_DIR=$(dirname "$real")
+            OPENCODE_PREFIX=$(prefix_of "$real") || OPENCODE_PREFIX=''
+        else
+            # dirname of nothing is ".", and binding "." would drop the
+            # caller's cwd into the sandbox.
+            OPENCODE_DIR=''
+            OPENCODE_PREFIX=''
+        fi
+        [[ -n $OPENCODE_DIR && -d $OPENCODE_DIR ]] || OPENCODE_DIR=''
+        return 0
+    done
+
+    # List every path that was searched. Listing only the ones that exist is
+    # useless here: a path that exists but is not executable is exactly the
+    # case worth pointing at.
+    printf '%ssearched:%s\n' "$C_DIM" "$C_RESET" >&2
+    printf '%s\n' "${candidates[@]}" | sort -u | while read -r d; do
+        printf '  %s%s%s\n' "$C_DIM" "$d" "$C_RESET" >&2
+    done
+    return 1
+}
+
+# Which array a flag fills, and which resolver validates it. Set as globals so
+# the caller does not have to repeat the mapping for the space and = forms.
+FLAG_DEST=""
+FLAG_KIND=""
+flag_target() {
+    case $1 in
+        -a|--allow) FLAG_DEST=ALLOW_PATHS; FLAG_KIND=allow ;;
+        -r|--ro)    FLAG_DEST=RO_PATHS;    FLAG_KIND=ro ;;
+        -d|--dev)   FLAG_DEST=DEV_PATHS;   FLAG_KIND=dev ;;
+        *)          return 1 ;;
+    esac
+}
+
+# Single resolution path for every form: one resolver, one refuse-list check.
+add_one() {
+    local -n _dest=$1
+    local kind=$2 value=$3
+    if [[ $kind == dev ]]; then
+        _dest+=("$(abspath_dev "$value")")
+    else
+        _dest+=("$(abspath "$value")")
+    fi
+}
+
+# Only the --flag=a,b form splits on commas; the space form does not, because a
+# directory name may contain a comma. Split with read rather than
+# `for e in ${2}`, which would glob against the host.
+add_list() {
+    local dest=$1 kind=$2
+    local -a entries=()
+    local entry
+    local IFS=,
+    read -r -a entries <<<"$3"
+    for entry in "${entries[@]}"; do
+        [[ -n $entry ]] && add_one "$dest" "$kind" "$entry"
+    done
+}
+
+parse_args() {
+    local -a argv=() passthru=()
+    local literal=0
+    local a
+
+    # Slice off everything after the first -- before parsing anything, so the
+    # option loop never has to reason about passthrough and never eats it.
+    for a in "$@"; do
+        if ((literal)); then passthru+=("$a"); continue; fi
+        [[ $a == -- ]] && literal=1 && continue
+        argv+=("$a")
+    done
+
+    local i=0
+    local n=${#argv[@]}
+
+    while ((i < n)); do
+        case ${argv[i]} in
+            -h|--help)    usage; exit 0 ;;
+            -V|--version) printf '%s %s\n' "$PROG" "$VERSION"; exit 0 ;;
+            -nc|--no-color) USE_COLOR=0; i=$((i + 1)) ;;
+            --no-net|-nn) SHARE_NET=0; i=$((i + 1)) ;;
+            --serve|-s)   SERVE=1; i=$((i + 1)) ;;
+
+            # One value per flag. Repeat the flag, or use the = form.
+            -p|--port)    set_port "${argv[i + 1]:-}"; i=$((i + 2)) ;;
+            -p=*|--port=*) set_port "${argv[i]#*=}"; i=$((i + 1)) ;;
+            --host=*)     set_host "${argv[i]#*=}"; i=$((i + 1)) ;;
+            --host)       set_host "${argv[i + 1]:-}"; i=$((i + 2)) ;;
+
+            # --flag=a,b and --flag=a. One branch for every path flag.
+            --allow=*|-a=*|--ro=*|-r=*|--dev=*|-d=*)
+                          flag_target "${argv[i]%%=*}"
+                          add_list "$FLAG_DEST" "$FLAG_KIND" "${argv[i]#*=}"
+                          i=$((i + 1)) ;;
+
+            -a|--allow|-r|--ro|-d|--dev)
+                          flag_target "${argv[i]}"
+                          if ((i + 1 >= n)) || [[ ${argv[i + 1]} == -* ]]; then
+                              die "${argv[i]} requires a value; use ${argv[i]}=VALUE if the value starts with a dash"
+                          fi
+                          add_one "$FLAG_DEST" "$FLAG_KIND" "${argv[i + 1]}"
+                          i=$((i + 2)) ;;
+
+            -*)          die "unknown option: ${argv[i]} (try --help)" ;;
+            # First bare word is the project; the rest go to opencode, so
+            # "ocs proj run" works without needing "--".
+            *)           if [[ -z $PROJECT ]]; then PROJECT=${argv[i]}
+                          else OPENCODE_ARGS+=("${argv[i]}"); fi
+                          i=$((i + 1)) ;;
+        esac
+    done
+
+    if ((${#passthru[@]})); then
+        OPENCODE_ARGS+=("${passthru[@]}")
+    fi
+}
+
+set_port() {
+    local p=${1:-}
+    [[ -n $p ]] || die "--port requires a port number"
+    [[ $p == -* ]] && die "--port requires a port number, got the flag '$p'"
+    SERVE_PORT=$p
+}
+
+set_host() {
+    local h=${1:-}
+    [[ -n $h ]] || die "--host requires a hostname"
+    [[ $h == -* ]] && die "--host requires a hostname, got the flag '$h'"
+    SERVE_HOST=$h
+}
+
+# Refuse a grant that IS one of these or is an ANCESTOR ("/") of one, since granting
+# one exposes the lot. "/" is handled in abspath(), which gives it a message of
+# its own. The check is one-directional, so /usr/local/share and ~/notes stay
+# grantable.
+readonly -a PROTECTED=(/dev /proc /sys /boot /etc /run /usr /var /home /root "$HOME")
+
+abspath() {
+    local p=$1 guarded
+    [[ -e $p ]] || die "no such path: $p"
+    local r
+    r=$(realpath "$p") || die "cannot resolve: $p"
+    [[ -d $r ]] || die "not a directory: $p"
+    if [[ $r == / ]]; then
+        # Almost always a mistyped path rather than a real request.
+        die "refusing to grant /: that is the entire filesystem. Give the full path, e.g. $HOME/project"
+    fi
+    for guarded in "${PROTECTED[@]}"; do
+        if [[ $r == "$guarded" || $guarded == "$r"/* ]]; then
+            die "refusing to grant $r: it would expose $guarded. Grant a subdirectory instead."
+        fi
+    done
+    printf '%s\n' "$r"
+}
+
+abspath_dev() {
+    local p=$1
+    [[ $p == /* ]] || p="/dev/$p"
+    [[ -e $p ]] || die "no such device: $1"
+    printf '%s\n' "$p"
+}
+
+build_args() {
+    # --share-net must follow the --unshare-all above: bwrap applies
+    # namespace options left to right.
+    if ((SHARE_NET)); then BWRAP_ARGS+=(--share-net); else BWRAP_ARGS+=(--unshare-net); fi
+
+    local p real path=""
+    for p in "${SYSTEM_DIRS[@]}"; do
+        path="${path:+$path:}$p"
+    done
+
+    # Homebrew, only when opencode actually lives under it.
+    if [[ -n $OPENCODE_PREFIX ]]; then
+        for p in "${BREW_SUBDIRS[@]}"; do
+            [[ -d $OPENCODE_PREFIX/$p ]] || continue
+            BWRAP_ARGS+=(--ro-bind-try "$OPENCODE_PREFIX/$p" "$OPENCODE_PREFIX/$p")
+        done
+        path="$OPENCODE_PREFIX/bin:$path"
+    fi
+
+    # The directory holding opencode itself, so a curl install in
+    # ~/.opencode/bin is not left dangling.
+    if [[ -n $OPENCODE_DIR && -d $OPENCODE_DIR ]]; then
+        BWRAP_ARGS+=(--ro-bind-try "$OPENCODE_DIR" "$OPENCODE_DIR")
+    fi
+
+    # Bind each toolchain prefix that exists, and add it to PATH. When the
+    # prefix is itself a symlink, bind its real path too so the binaries inside
+    # resolve. An entry already in PATH (the brew bin) is not added twice.
+    for p in "${TOOLCHAIN_DIRS[@]}"; do
+        [[ -d $p ]] || continue
+        BWRAP_ARGS+=(--ro-bind-try "$p" "$p")
+        case ":$path:" in *":$p:"*) ;; *) path="$path:$p" ;; esac
+        real=$(readlink -f "$p" 2>/dev/null) || continue
+        [[ $real == "$p" ]] && continue
+        BWRAP_ARGS+=(--ro-bind-try "$real" "$real")
+    done
+    BWRAP_ARGS+=(--setenv PATH "$path")
+
+    for p in "${ALLOW_PATHS[@]}"; do BWRAP_ARGS+=(--bind "$p" "$p"); done
+    for p in "${RO_PATHS[@]}";    do BWRAP_ARGS+=(--ro-bind "$p" "$p"); done
+    for p in "${DEV_PATHS[@]}";   do BWRAP_ARGS+=(--dev-bind "$p" "$p"); done
+
+    # The project goes through the same guard as --allow/--ro, already checked
+    # in main().
+    BWRAP_ARGS+=(--bind "$PROJECT" "$PROJECT" --chdir "$PROJECT")
+
+    local key
+    for key in ANTHROPIC_API_KEY OPENAI_API_KEY OPENCODE_API_KEY; do
+        if [[ -n ${!key:-} ]]; then BWRAP_ARGS+=(--setenv "$key" "${!key}"); fi
+    done
+}
+
+run() {
+    # Checked before any side effect: "opencode service stop" below talks to a
+    # daemon socket and can block.
+    if [[ -n $SERVE_PORT ]] && ! ((SERVE)); then
+        die "--port only means something with --serve"
+    fi
+    if ((SERVE)) && ! ((SHARE_NET)); then
+        die "--serve cannot be combined with --no-net: the web UI would be unreachable"
+    fi
+
+    build_args
+    if [[ -n ${OCS_TEST_CMD:-} ]]; then
+        exec bwrap "${BWRAP_ARGS[@]}" -- /bin/sh -c "$OCS_TEST_CMD"
+    fi
+    if ((SHARE_NET)); then
+        # Bounded: this talks to a daemon socket and can sit there for a long
+        # time when the service is wedged or gone. A sandbox that never starts
+        # because a cleanup step stalled is not worth it.
+        timeout 5 opencode service stop >/dev/null 2>&1 || true
+    fi
+
+    if ((SERVE)); then
+        local -a serve_args=(serve)
+        [[ -n $SERVE_HOST ]] && serve_args+=(--hostname "$SERVE_HOST")
+        if [[ -n $SERVE_PORT ]]; then
+            serve_args+=(--port "$SERVE_PORT")
+            info "${C_DIM}web UI:${C_RESET} ${C_CYAN}http://${SERVE_HOST:-127.0.0.1}:${SERVE_PORT}${C_RESET}"
+        elif [[ -n $SERVE_HOST ]]; then
+            info "${C_DIM}web UI:${C_RESET} ${C_CYAN}http://${SERVE_HOST}${C_RESET} ${C_DIM}(opencode prints the exact port once bound)${C_RESET}"
+        else
+            info "${C_DIM}web UI:${C_RESET} ${C_CYAN}http://127.0.0.1${C_RESET} ${C_DIM}(opencode prints the exact address and port once bound)${C_RESET}"
+        fi
+        exec bwrap "${BWRAP_ARGS[@]}" -- "$OPENCODE_BIN" "${serve_args[@]}" "${OPENCODE_ARGS[@]}"
+    fi
+
+    exec bwrap "${BWRAP_ARGS[@]}" -- "$OPENCODE_BIN" "${OPENCODE_ARGS[@]}"
+}
+
+main() {
+    # --no-color must be honoured before setup_colors runs, so it is detected
+    # here rather than only in parse_args. Scanning stops at "--".
+    local a
+    for a in "$@"; do
+        case $a in
+            -nc|--no-color) USE_COLOR=0; break ;;
+            --) break ;;
+        esac
+    done
+    setup_colors
+
+    case ${1:-} in
+        -h|--help)   usage; exit 0 ;;
+        -V|--version) printf '%s %s\n' "$PROG" "$VERSION"; exit 0 ;;
+    esac
+    [[ -n ${1:-} ]] || { usage; exit 2; }
+
+    parse_args "$@"
+    [[ -n $PROJECT ]] || die "no project directory given (try --help)"
+    # abspath, not realpath: the project is bound read-write, so it faces the
+    # same refuse-list as --allow.
+    PROJECT=$(abspath "$PROJECT")
+
+    search_opencode || die "opencode not found; install it, or set PATH to include it"
+    info "${C_DIM}using${C_RESET} ${C_CYAN}${OPENCODE_BIN}${C_RESET}"
+
+    run
+}
+
+main "$@"
